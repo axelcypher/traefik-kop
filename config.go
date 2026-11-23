@@ -21,6 +21,7 @@ type Config struct {
 	Hostname     string
 	BindIP       string
 	SkipReplace  bool
+	DefaultPort  int
 	RedisAddr    string
 	RedisTTL     int
 	RedisUser    string

@@ -68,14 +68,21 @@ func createConfigHandler(config Config, store TraefikStore, dp *docker.Provider,
 
 		filterServices(dc, &conf, config.Namespace)
 
+		http := conf.HTTP
+		if config.DefaultPort > 0 {
+			// Keep the Docker routes for the ingress configuration and handle TCP/UDP as usual.
+			conf.HTTP = &dynamic.HTTPConfiguration{}
+		}
 		if !dp.UseBindPortIP && !config.SkipReplace {
-			// if not using traefik's built in IP/Port detection, use our own
 			replaceIPs(dc, &conf, config.BindIP)
 		} else {
 			log.Debug().Msgf("skipping IP replacement (useBindPortIP=%v, skipReplace=%v)", dp.UseBindPortIP, config.SkipReplace)
 		}
-
+		applyHTTPPortOverrides(dc, &conf)
 		mergeLoadBalancers(dc, &conf, store)
+		if config.DefaultPort > 0 {
+			conf.HTTP = buildHTTPIngress(dc, http, config)
+		}
 
 		err := store.Store(conf)
 		if err != nil {
@@ -86,6 +93,10 @@ func createConfigHandler(config Config, store TraefikStore, dp *docker.Provider,
 
 // Start the main traefik-kop run-loop
 func Start(config Config) {
+	if config.DefaultPort > 0 && !ingressHostname.MatchString(config.Hostname) {
+		log.Fatal().Msg("KOP_HOSTNAME must start with a lowercase letter or digit and use only lowercase letters, digits, dots and hyphens when KOP_DEFAULT_PORT is enabled")
+	}
+
 	dockerClient, err := createDockerClient(config.DockerHost)
 	if err != nil {
 		log.Fatal().Msgf("failed to create docker client: %s", err)
@@ -423,21 +434,21 @@ func getRouterOfService(conf *dynamic.Configuration, svcName string, svcType str
 
 	if svcType == "http" {
 		for routerName, router := range conf.HTTP.Routers {
-			if router.Service == svcName {
+			if stripDocker(router.Service) == svcName {
 				name = routerName
 				break
 			}
 		}
 	} else if svcType == "tcp" {
 		for routerName, router := range conf.TCP.Routers {
-			if router.Service == svcName {
+			if stripDocker(router.Service) == svcName {
 				name = routerName
 				break
 			}
 		}
 	} else if svcType == "udp" {
 		for routerName, router := range conf.UDP.Routers {
-			if router.Service == svcName {
+			if stripDocker(router.Service) == svcName {
 				name = routerName
 				break
 			}

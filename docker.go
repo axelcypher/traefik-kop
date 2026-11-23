@@ -111,6 +111,11 @@ func (dc *dockerCache) findContainerByServiceName(svcType string, svcName string
 		// check labels
 		svcNeedle := fmt.Sprintf("traefik.%s.services.%s.", svcType, svcName)
 		routerNeedle := fmt.Sprintf("traefik.%s.routers.%s.", svcType, routerName)
+		if svcType == "http" {
+			if _, ok := container.Config.Labels[httpPortOverrideLabel(svcName)]; ok {
+				return container, nil
+			}
+		}
 		for k := range container.Config.Labels {
 			if strings.HasPrefix(k, svcNeedle) || (routerName != "" && strings.HasPrefix(k, routerNeedle)) {
 				log.Debug().Msgf("found container '%s' (%s) for service '%s'", container.Name, container.ID, svcName)

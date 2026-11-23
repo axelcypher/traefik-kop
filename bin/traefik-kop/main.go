@@ -76,6 +76,11 @@ func flags() {
 				Usage:   "Disable custom IP replacement",
 				EnvVars: []string{"SKIP_REPLACE"},
 			},
+			&cli.IntFlag{
+				Name:    "default-port",
+				Usage:   "Forward HTTP routes to the Docker ingress at BIND_IP on this HTTPS port",
+				EnvVars: []string{"KOP_DEFAULT_PORT"},
+			},
 			&cli.StringFlag{
 				Name:    "redis-addr",
 				Usage:   "Redis address",
@@ -223,6 +228,11 @@ func splitStringArr(str string) []string {
 func doStart(c *cli.Context) error {
 	traefikkop.Version = version
 
+	defaultPort := c.Int("default-port")
+	if c.IsSet("default-port") && (defaultPort < 1 || defaultPort > 65535) {
+		return fmt.Errorf("--default-port (KOP_DEFAULT_PORT) must be between 1 and 65535")
+	}
+
 	namespaces := splitStringArr(c.String("namespace"))
 
 	// Determine bind IP: precedence -> explicit --bind-ip -> --bind-interface -> auto-detect
@@ -247,6 +257,7 @@ func doStart(c *cli.Context) error {
 		Hostname:            c.String("hostname"),
 		BindIP:              bindIP,
 		SkipReplace:         c.Bool("skip-replace"),
+		DefaultPort:         defaultPort,
 		RedisAddr:           c.String("redis-addr"),
 		RedisUser:           c.String("redis-user"),
 		RedisPass:           c.String("redis-pass"),

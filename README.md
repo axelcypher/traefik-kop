@@ -38,6 +38,7 @@ them to a given `redis` instance. Simply configure your `traefik` node with a
     - [Disable IP Replacement (auto-detection)](#disable-ip-replacement-auto-detection)
   - [Load Balancer Merging](#load-balancer-merging)
   - [Service port binding](#service-port-binding)
+  - [Forward HTTP routes to the Docker ingress](#forward-http-routes-to-the-docker-ingress)
   - [Namespaces](#namespaces)
     - [Namespace via label prefix](#namespace-via-label-prefix)
   - [Docker API](#docker-api)
@@ -121,6 +122,7 @@ GLOBAL OPTIONS:
    --bind-ip value        IP address to bind services to [$BIND_IP]
    --bind-interface value Network interface to derive bind IP (overrides auto-detect) [$BIND_INTERFACE]
    --skip-replace         Disable custom IP replacement (default: false) [$SKIP_REPLACE]
+   --default-port value   Forward HTTP routes to the Docker ingress at BIND_IP on this HTTPS port [$KOP_DEFAULT_PORT]
    --redis-addr value     Redis address (default: "127.0.0.1:6379") [$REDIS_ADDR]
    --redis-user value     Redis username (default: "default") [$REDIS_USER]
    --redis-pass value     Redis password (if needed) [$REDIS_PASS]
@@ -268,6 +270,47 @@ unchanged. This preserves explicit host-port labels and supports *host networkin
 If a number matches an internal port, its published host port takes precedence.
 Published ports must be reachable from Traefik; a loopback-only binding is only
 reachable on that host.
+
+An HTTP service can set the final port published by kop directly:
+
+```yaml
+labels:
+  - "kop.traefik.http.services.nginx.loadbalancer.server.port=123"
+```
+
+Use the Traefik service name in place of `nginx`. Kop uses port `123`
+directly, bypassing Docker port mapping for that service.
+
+## Forward HTTP routes to the Docker ingress
+
+On each kop instance, set the HTTPS port of its Docker ingress and a stable,
+unique hostname:
+
+```yaml
+environment:
+  KOP_HOSTNAME: docker-01
+  BIND_IP: 10.8.0.25
+  KOP_DEFAULT_PORT: "443"
+```
+
+Kop publishes a shared HTTPS backend for that host at `https://10.8.0.25:443`.
+An app with a kop port label gets its own HTTPS backend on the same address, at
+its specified port. For a router pointing to an external provider such as
+`api@internal`, use the router name in the kop port label.
+
+Published HTTP router names get a hostname prefix, so
+`traefik-traefik` becomes `docker-01_traefik-traefik`. Kop copies the
+rule and priority and points the router at its host backend. The incoming
+Host header and path reach the Docker ingress, which handles its own
+middlewares and services, including the dashboard. Configure TLS and the
+default entrypoints on the receiving Traefik instance in k3s. Its TLS client
+must trust the Docker ingress certificate for the backend address.
+
+Keep each instance's existing Redis identity (`KOP_HOSTNAME`) when enabling this
+mode so kop can remove its previously published keys. Instances using the mode
+must each have a unique hostname consisting of lowercase letters, digits, dots
+or hyphens. HTTP routing uses Docker's rules as published, so each dashboard
+still needs its own host rule.
 
 ## Namespaces
 
