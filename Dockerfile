@@ -1,5 +1,4 @@
 FROM --platform=$BUILDPLATFORM alpine:3.23 AS certificates
-RUN apk add --no-cache ca-certificates
 
 FROM scratch
 ENTRYPOINT ["/traefik-kop"]
