@@ -302,8 +302,9 @@ Published HTTP router names get a hostname prefix, so
 `traefik-traefik` becomes `docker-01_traefik-traefik`. Kop copies the
 rule and priority and points the router at its host backend. The incoming
 Host header and path reach the Docker ingress, which handles its own
-middlewares and services, including the dashboard. Configure TLS and the
-default entrypoints on the receiving Traefik instance in k3s. Its TLS client
+middlewares and services, including the dashboard. Kop assigns every ingress
+router to `websecure` and enables TLS with an empty TLS configuration. Configure
+certificates on the receiving Traefik instance in k3s. Its TLS client
 must trust the Docker ingress certificate for the backend address.
 
 Keep each instance's existing Redis identity (`KOP_HOSTNAME`) when enabling this

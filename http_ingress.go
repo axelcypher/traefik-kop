@@ -46,9 +46,11 @@ func buildHTTPIngress(dc *dockerCache, docker *dynamic.HTTPConfiguration, config
 			}
 		}
 		http.Routers[config.Hostname+"_"+name] = &dynamic.Router{
-			Rule:     router.Rule,
-			Priority: router.Priority,
-			Service:  service,
+			EntryPoints: []string{"websecure"},
+			TLS:         &dynamic.RouterTLSConfig{},
+			Rule:        router.Rule,
+			Priority:    router.Priority,
+			Service:     service,
 		}
 	}
 	return http

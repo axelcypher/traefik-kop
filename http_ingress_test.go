@@ -75,9 +75,11 @@ func TestHTTPIngressPublishesSeparateHostRoutes(t *testing.T) {
 	keys, err := store1.Gets(dashboard + "*")
 	require.NoError(t, err)
 	require.Equal(t, map[string]string{
-		dashboard + "rule":     "Host(`dashboard.example.com`)",
-		dashboard + "priority": "10",
-		dashboard + "service":  "docker-01",
+		dashboard + "rule":          "Host(`dashboard.example.com`)",
+		dashboard + "priority":      "10",
+		dashboard + "entryPoints/0": "websecure",
+		dashboard + "tls":           "true",
+		dashboard + "service":       "docker-01",
 	}, keys)
 	require.False(t, redis.Exists("traefik/http/middlewares/strip/stripPrefix/prefixes/0"))
 	require.False(t, redis.Exists("traefik/http/services/app/loadBalancer/servers/0/url"))
