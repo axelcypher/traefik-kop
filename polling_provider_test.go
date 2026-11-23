@@ -27,10 +27,12 @@ func (n *noopProvider) Provide(configurationChan chan<- dynamic.Message, pool *s
 
 func TestPollingProvider_CountsPolls(t *testing.T) {
 	var callCount int32
+	var refreshCount atomic.Int32
 	upstream := &noopProvider{calls: &callCount}
 	store := &testStore{}
 	interval := 50 * time.Millisecond
 	pp := NewPollingProvider(interval, upstream, store)
+	pp.refreshLabels = func() { refreshCount.Add(1) }
 	pp.Init()
 
 	ch := make(chan dynamic.Message)
@@ -50,6 +52,9 @@ func TestPollingProvider_CountsPolls(t *testing.T) {
 	cancel()
 
 	calls := atomic.LoadInt32(&callCount)
+	if refreshCount.Load() < 3 {
+		t.Fatal("kop labels were not refreshed during polling")
+	}
 	if calls < 3 || calls > 6 {
 		t.Errorf("expected 3-6 polls, got %d", calls)
 	}

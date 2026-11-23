@@ -119,3 +119,47 @@ func TestStandaloneHTTPPortOverrideUsesFinalPort(t *testing.T) {
 	assertServiceIPs(t, store, []svc{{"app", "http", "http://10.8.0.25:123"}})
 	require.Equal(t, "app", g(store, "traefik/http/routers/app/service"))
 }
+
+func TestHTTPIngressRefreshesKopOnlyPortChanges(t *testing.T) {
+	client := createTestClient(map[string]string{
+		"traefik.http.services.unifi-network.loadbalancer.server.port": "8443",
+	})
+	conf := dynamic.Configuration{
+		HTTP: &dynamic.HTTPConfiguration{
+			Routers: map[string]*dynamic.Router{
+				"unifi-network@docker": {Service: "unifi-network", Rule: "Host(`unifi.example.com`)"},
+			},
+			Services: map[string]*dynamic.Service{
+				"unifi-network@docker": {LoadBalancer: &dynamic.ServersLoadBalancer{
+					Servers: []dynamic.Server{{URL: "https://172.18.0.2:8443"}},
+				}},
+			},
+		},
+		TCP: &dynamic.TCPConfiguration{},
+		UDP: &dynamic.UDPConfiguration{},
+	}
+	redis := miniredis.RunT(t)
+	store := NewRedisStore("vm-docker-01", redis.Addr(), 0, "", "", 0, nil, "", nil)
+	refresh := &configurationRefresh{handle: createConfigHandler(
+		Config{Hostname: "vm-docker-01", BindIP: "10.8.0.25", DefaultPort: 443},
+		store, &docker.Provider{}, client,
+	)}
+	refresh.Refresh() // No provider configuration received yet.
+	refresh.Update(conf)
+	key := "traefik/http/routers/vm-docker-01_unifi-network/service"
+	require.Equal(t, "vm-docker-01", g(store, key))
+
+	// Traefik's configuration stays identical when only a kop label changes.
+	client.container.Config.Labels[httpPortOverrideLabel("unifi-network")] = "8443"
+	refresh.Refresh()
+	require.Equal(t, "vm-docker-01_unifi-network_8443", g(store, key))
+	assertServiceIPs(t, store, []svc{{"vm-docker-01_unifi-network_8443", "http", "https://10.8.0.25:8443"}})
+	require.Equal(t, "websecure", g(store, "traefik/http/routers/vm-docker-01_unifi-network/entryPoints/0"))
+
+	delete(client.container.Config.Labels, httpPortOverrideLabel("unifi-network"))
+	refresh.Refresh()
+	require.Equal(t, "vm-docker-01", g(store, key))
+	require.Empty(t, g(store, "traefik/http/services/vm-docker-01_unifi-network_8443/loadBalancer/servers/0/url"))
+	assertServiceIPs(t, store, []svc{{"vm-docker-01", "http", "https://10.8.0.25:443"}})
+	require.Equal(t, "unifi-network", conf.HTTP.Routers["unifi-network@docker"].Service)
+}

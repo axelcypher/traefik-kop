@@ -279,7 +279,9 @@ labels:
 ```
 
 Use the Traefik service name in place of `nginx`. Kop uses port `123`
-directly, bypassing Docker port mapping for that service.
+directly, bypassing Docker port mapping for that service. Changes to kop-only
+labels are re-evaluated every `KOP_POLL_INTERVAL` seconds (default 60). If polling
+is disabled, restart kop after changing these labels.
 
 ## Forward HTTP routes to the Docker ingress
 

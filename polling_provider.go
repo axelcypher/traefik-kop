@@ -18,6 +18,7 @@ type PollingProvider struct {
 	refreshInterval  time.Duration
 	upstreamProvider provider.Provider
 	store            TraefikStore
+	refreshLabels    func()
 
 	mu                  sync.Mutex
 	activeAttempt       *safe.Pool
@@ -55,6 +56,9 @@ func (p *PollingProvider) Provide(configurationChan chan<- dynamic.Message, pool
 			case <-ticker.C:
 				logger.Debug().Msg("tick")
 				p.startPollAttempt(ctx, configurationChan, logger)
+				if p.refreshLabels != nil {
+					p.refreshLabels()
+				}
 
 				// Renew cached configuration or restore it if Redis lost it.
 				err := p.store.KeepConfAlive()

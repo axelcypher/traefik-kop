@@ -5,7 +5,32 @@ import (
 	"github.com/traefik/traefik/v3/pkg/provider"
 	"github.com/traefik/traefik/v3/pkg/safe"
 	"github.com/traefik/traefik/v3/pkg/server"
+	"sync"
 )
+
+// configurationRefresh retains the original provider configuration, before kop
+// rewrites service names and endpoints. Refresh also evaluates kop-only labels,
+// which Traefik excludes from its configuration change detection.
+type configurationRefresh struct {
+	mu     sync.Mutex
+	latest *dynamic.Configuration
+	handle func(dynamic.Configuration)
+}
+
+func (r *configurationRefresh) Update(conf dynamic.Configuration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.latest = conf.DeepCopy()
+	r.handle(*r.latest.DeepCopy())
+}
+
+func (r *configurationRefresh) Refresh() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.latest != nil {
+		r.handle(*r.latest.DeepCopy())
+	}
+}
 
 // newConfigurationWatcher leaves default entrypoint selection to the remote
 // Traefik instance. Since 3.7, the watcher requires an entrypoint to retain TLS

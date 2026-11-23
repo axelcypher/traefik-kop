@@ -159,16 +159,19 @@ func Start(config Config) {
 	}
 
 	handleConfigChange := createConfigHandler(config, store, dp, dockerClient)
+	refresh := &configurationRefresh{handle: handleConfigChange}
 
 	pollingDockerProvider := newDockerProvider(config)
 	pollingDockerProvider.Watch = false
+	poller := NewPollingProvider(
+		time.Second*time.Duration(config.PollInterval),
+		pollingDockerProvider,
+		store,
+	)
+	poller.refreshLabels = refresh.Refresh
 	multiProvider := NewMultiProvider([]provider.Provider{
 		providerAggregator,
-		NewPollingProvider(
-			time.Second*time.Duration(config.PollInterval),
-			pollingDockerProvider,
-			store,
-		),
+		poller,
 	})
 
 	// initialize all providers
@@ -178,7 +181,7 @@ func Start(config Config) {
 	}
 
 	watcher := newConfigurationWatcher(routinesPool, multiProvider)
-	watcher.AddListener(handleConfigChange)
+	watcher.AddListener(refresh.Update)
 	watcher.Start()
 
 	select {} // go forever
