@@ -17,7 +17,7 @@ import (
 type PollingProvider struct {
 	refreshInterval  time.Duration
 	upstreamProvider provider.Provider
-	store            TraefikStore
+	store            keepAliver
 	refreshLabels    func()
 
 	mu                  sync.Mutex
@@ -26,7 +26,7 @@ type PollingProvider struct {
 	attemptNumber       uint64
 }
 
-func NewPollingProvider(refreshInterval time.Duration, upstream provider.Provider, store TraefikStore) *PollingProvider {
+func NewPollingProvider(refreshInterval time.Duration, upstream provider.Provider, store keepAliver) *PollingProvider {
 	return &PollingProvider{
 		refreshInterval:  refreshInterval,
 		upstreamProvider: upstream,

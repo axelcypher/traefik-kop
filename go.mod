@@ -18,6 +18,7 @@ require (
 	github.com/docker/go-connections v0.8.1
 	github.com/echovault/sugardb v0.17.0
 	github.com/gofiber/fiber/v2 v2.52.9
+	github.com/kvtools/redis v1.2.1
 	github.com/pkg/errors v0.9.1
 	github.com/redis/go-redis/v9 v9.21.0
 	github.com/rs/zerolog v1.34.0
@@ -217,7 +218,6 @@ require (
 	github.com/kolo/xmlrpc v0.0.0-20220921171641-a4b6fa1dd06b // indirect
 	github.com/kvtools/consul v1.0.2 // indirect
 	github.com/kvtools/etcdv3 v1.0.3 // indirect
-	github.com/kvtools/redis v1.2.1 // indirect
 	github.com/kvtools/valkeyrie v1.0.0 // indirect
 	github.com/kvtools/zookeeper v1.0.2 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect

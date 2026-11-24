@@ -163,3 +163,59 @@ func TestHTTPIngressRefreshesKopOnlyPortChanges(t *testing.T) {
 	assertServiceIPs(t, store, []svc{{"vm-docker-01", "http", "https://10.8.0.25:443"}})
 	require.Equal(t, "unifi-network", conf.HTTP.Routers["unifi-network@docker"].Service)
 }
+
+func TestHTTPIngressTransportAndEntryPoints(t *testing.T) {
+	client := createTestClient(map[string]string{})
+	conf := dynamic.Configuration{
+		HTTP: &dynamic.HTTPConfiguration{
+			Routers: map[string]*dynamic.Router{
+				"app@docker": {Rule: "Host(`app.example.com`)", Service: "app", RuleSyntax: "v2"},
+			},
+			Services: map[string]*dynamic.Service{},
+		},
+		TCP: &dynamic.TCPConfiguration{},
+		UDP: &dynamic.UDPConfiguration{},
+	}
+
+	store := &testStore{}
+	config := Config{Hostname: "docker-01", BindIP: "10.8.0.25", DefaultPort: 443}
+	createConfigHandler(config, store, &docker.Provider{}, client)(*conf.DeepCopy())
+	require.Equal(t, "true", g(store, "traefik/http/serversTransports/docker-01_ingress/insecureSkipVerify"))
+	require.Equal(t, "docker-01_ingress", g(store, "traefik/http/services/docker-01/loadBalancer/serversTransport"))
+	require.Equal(t, "true", g(store, "traefik/http/services/docker-01/loadBalancer/passHostHeader"))
+	require.Equal(t, "websecure", g(store, "traefik/http/routers/docker-01_app/entryPoints/0"))
+	require.Equal(t, "v2", g(store, "traefik/http/routers/docker-01_app/ruleSyntax"))
+
+	store = &testStore{}
+	config.IngressVerifyBackendCerts = true
+	config.IngressEntryPoints = []string{"https", "internal"}
+	createConfigHandler(config, store, &docker.Provider{}, client)(*conf.DeepCopy())
+	require.Empty(t, g(store, "traefik/http/serversTransports/docker-01_ingress/insecureSkipVerify"))
+	require.Empty(t, g(store, "traefik/http/services/docker-01/loadBalancer/serversTransport"))
+	require.Equal(t, "https", g(store, "traefik/http/routers/docker-01_app/entryPoints/0"))
+	require.Equal(t, "internal", g(store, "traefik/http/routers/docker-01_app/entryPoints/1"))
+}
+
+func TestHTTPIngressPublishesOneRouterPerRule(t *testing.T) {
+	http := &dynamic.HTTPConfiguration{
+		Routers: map[string]*dynamic.Router{
+			// HTTP router that only redirects, sorted before its TLS twin.
+			"a-http@docker":  {Rule: "Host(`a.example.com`)", Middlewares: []string{"to-https"}},
+			"b-https@docker": {Rule: "Host(`a.example.com`)", TLS: &dynamic.RouterTLSConfig{}},
+			// Neither uses TLS: skip the redirect, recognized by its definition.
+			"c-plain@docker": {Rule: "Host(`c.example.com`)", Middlewares: []string{"https-only@docker"}},
+			"d-plain@docker": {Rule: "Host(`c.example.com`)"},
+			// Same score: the first name wins.
+			"e@docker": {Rule: "Host(`e.example.com`)"},
+			"f@docker": {Rule: "Host(`e.example.com`)"},
+			// Redirect middleware from another provider, recognized by name.
+			"g@docker": {Rule: "Host(`g.example.com`)", Middlewares: []string{"redirect-to-https@file"}},
+			"h@docker": {Rule: "Host(`g.example.com`)"},
+		},
+		Middlewares: map[string]*dynamic.Middleware{
+			"to-https@docker":   {RedirectScheme: &dynamic.RedirectScheme{Scheme: "https"}},
+			"https-only@docker": {RedirectScheme: &dynamic.RedirectScheme{Scheme: "https"}},
+		},
+	}
+	require.Equal(t, []string{"b-https@docker", "d-plain@docker", "e@docker", "h@docker"}, selectIngressRouters(http))
+}

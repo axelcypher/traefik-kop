@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased (fork)
+
+### New Features
+
+- Forward HTTP routes to the Docker ingress of each host (`KOP_DEFAULT_PORT`) and set the final backend port with `kop.traefik.http.services.<name>.loadbalancer.server.port`
+- Per-host views (`KOP_VIEW`): publish the routes of all other hosts below `traefik-<hostname>` for the local Traefik. Local routes take precedence; HTTP routes on several hosts are balanced
+- Import the HTTP routers of another Traefik, e.g. in k3s, into the views (`KOP_IMPORT_TRAEFIK_API`)
+- Configurable ingress entrypoints (`KOP_INGRESS_ENTRYPOINTS`) and a `serversTransport` that skips certificate verification for the hop to the receiving Traefik (`KOP_INGRESS_VERIFY_BACKEND_CERTS` to verify)
+- Sentinel credentials (`REDIS_SENTINEL_USER`, `REDIS_SENTINEL_PASS`) and `KOP_SHARED_ROOT` to stop publishing to the shared root key
+
+### Fixes
+
+- Write Redis only when the configuration changes; on renewal, restore keys that Redis lost or holds with older values, also without a TTL
+- Log failed Redis writes and retry them on the next refresh instead of panicking
+- Publish one ingress router per rule, preferring the TLS router over an HTTP router that only redirects
+
+### Other
+
+- Run fork builds on GitHub-hosted runners and publish the `main` image from the fork
+
 ## v0.21.0
 
 ### New Features

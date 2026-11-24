@@ -26,7 +26,8 @@ env:
 jobs:
   build:
     name: Build
-    runs-on: self-hosted
+    # Forks have no self-hosted runner.
+    runs-on: ${{ github.repository_owner == 'jittering' && 'self-hosted' || 'ubuntu-latest' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
