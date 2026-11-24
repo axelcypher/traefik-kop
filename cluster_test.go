@@ -3,6 +3,7 @@ package traefikkop
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -228,9 +229,7 @@ func TestViewFollowsPeerNotifications(t *testing.T) {
 
 	// The subscription may start after the first publish; retry until it is live.
 	require.Eventually(t, func() bool {
-		two.registry.mu.Lock()
-		delete(two.registry.last, "docker-02") // force a new notification
-		two.registry.mu.Unlock()
+		c.redis.Del(peerKeyPrefix + "docker-02") // force a new notification
 		two.handle(dockerRoutes(map[string]string{"two": "Host(`two.example.com`)"}))
 		v, _ := c.redis.Get("traefik-docker-01/http/routers/docker-02_two/rule")
 		return v == "Host(`two.example.com`)"
@@ -309,4 +308,117 @@ func TestRedisStoreSkipsUnchangedConfiguration(t *testing.T) {
 	require.False(t, server.Exists(key))
 	require.NoError(t, store.KeepConfAlive()) // repairs lost keys without a TTL
 	require.True(t, server.Exists(key))
+}
+
+func TestBuildViewGroupsTCPAndUDPByEntryPoints(t *testing.T) {
+	tcp := func(entryPoint, service, address string) dynamic.Configuration {
+		return dynamic.Configuration{
+			TCP: &dynamic.TCPConfiguration{
+				Routers: map[string]*dynamic.TCPRouter{
+					service + "@docker": {Rule: "HostSNI(`*`)", EntryPoints: []string{entryPoint}, Service: service},
+				},
+				Services: map[string]*dynamic.TCPService{
+					service + "@docker": {LoadBalancer: &dynamic.TCPServersLoadBalancer{Servers: []dynamic.TCPServer{{Address: address}}}},
+				},
+			},
+			UDP: &dynamic.UDPConfiguration{
+				Routers: map[string]*dynamic.UDPRouter{service + "-udp@docker": {EntryPoints: []string{entryPoint + "-udp"}, Service: service}},
+			},
+		}
+	}
+	own := tcp("mqtt", "mqtt", "10.8.0.25:1883")
+	peers := map[string]dynamic.Configuration{
+		"docker-02": tcp("postgres", "postgres", "10.8.0.26:5432"),
+		"docker-03": tcp("redis", "redis", "10.8.0.27:6379"),
+		"docker-04": tcp("mqtt", "mqtt", "10.8.0.28:1883"), // same as local
+	}
+	view := buildView(own, peers)
+	require.Equal(t, []string{"postgres", "redis"}, sortedKeys(view.TCP.Routers))
+	require.Equal(t, []string{"postgres-udp", "redis-udp"}, sortedKeys(view.UDP.Routers))
+}
+
+func TestBuildViewRenamesConflictingNames(t *testing.T) {
+	db := func(sni, address string) dynamic.Configuration {
+		return dynamic.Configuration{
+			HTTP: &dynamic.HTTPConfiguration{
+				Routers: map[string]*dynamic.Router{
+					"web@docker": {Rule: "Host(`" + sni + ".example.com`)", Service: "web", Middlewares: []string{"auth@docker", "chain@file"}},
+				},
+				Services: map[string]*dynamic.Service{
+					"web@docker": {LoadBalancer: &dynamic.ServersLoadBalancer{Servers: []dynamic.Server{{URL: "http://" + address}}}},
+				},
+				Middlewares: map[string]*dynamic.Middleware{
+					"auth@docker": {BasicAuth: &dynamic.BasicAuth{Users: []string{sni}}},
+				},
+			},
+			TCP: &dynamic.TCPConfiguration{
+				Routers: map[string]*dynamic.TCPRouter{"db@docker": {Rule: "HostSNI(`" + sni + "`)", Service: "db"}},
+				Services: map[string]*dynamic.TCPService{
+					"db@docker": {LoadBalancer: &dynamic.TCPServersLoadBalancer{Servers: []dynamic.TCPServer{{Address: address}}}},
+				},
+			},
+		}
+	}
+	peers := map[string]dynamic.Configuration{
+		"docker-02": db("pg-a", "10.0.0.2:5432"),
+		"docker-03": db("pg-b", "10.0.0.3:5432"),
+	}
+	view := buildView(dynamic.Configuration{}, peers)
+
+	require.Equal(t, "db", view.TCP.Routers["db"].Service)
+	require.Equal(t, "db_docker-03", view.TCP.Routers["db_docker-03"].Service)
+	require.Equal(t, "10.0.0.3:5432", view.TCP.Services["db_docker-03"].LoadBalancer.Servers[0].Address)
+	require.Equal(t, "10.0.0.2:5432", view.TCP.Services["db"].LoadBalancer.Servers[0].Address)
+
+	require.Equal(t, "web_docker-03", view.HTTP.Routers["web_docker-03"].Service)
+	require.Equal(t, []string{"auth_docker-03", "chain@file"}, view.HTTP.Routers["web_docker-03"].Middlewares)
+	require.Equal(t, dynamic.Users{"pg-b"}, view.HTTP.Middlewares["auth_docker-03"].BasicAuth.Users)
+	require.Equal(t, []string{"auth", "chain@file"}, view.HTTP.Routers["web"].Middlewares)
+
+	// Identical objects are shared, not duplicated.
+	peers["docker-03"] = db("pg-a", "10.0.0.2:5432")
+	peers["docker-03"].HTTP.Routers["web@docker"].Rule = "Host(`other.example.com`)"
+	view = buildView(dynamic.Configuration{}, peers)
+	require.Equal(t, []string{"web"}, sortedKeys(view.HTTP.Services))
+	require.Equal(t, "web", view.HTTP.Routers["web_docker-03"].Service)
+}
+
+func TestKeepAliveRepairsStaleValues(t *testing.T) {
+	for _, ttl := range []int{0, 300} {
+		t.Run(fmt.Sprint(ttl), func(t *testing.T) {
+			server, store, conf := newTTLTestStore(t, ttl)
+			require.NoError(t, store.Store(conf))
+			key := "traefik/http/services/nginx/loadBalancer/servers/0/url"
+			current, _ := server.Get(key)
+			// A failover to a replica that missed the last write.
+			require.NoError(t, server.Set(key, "http://10.0.0.99:80"))
+			require.NoError(t, store.KeepConfAlive())
+			restored, _ := server.Get(key)
+			require.Equal(t, current, restored)
+		})
+	}
+}
+
+func TestPeerRegistryRepairsStaleConfiguration(t *testing.T) {
+	c := newCluster(t)
+	registry := newPeerRegistry(c.client, "docker-01", 300)
+	other := newPeerRegistry(c.client, "docker-02", 300)
+	current := dockerRoutes(map[string]string{"one": "Host(`b.example.com`)"})
+	stale := dockerRoutes(map[string]string{"one": "Host(`a.example.com`)"})
+	key := peerKeyPrefix + "docker-01"
+
+	require.NoError(t, registry.publish("docker-01", current))
+	want, _ := c.redis.Get(key)
+
+	// Another instance (or an older snapshot) left a stale value behind.
+	require.NoError(t, other.publish("docker-01", stale))
+	require.NoError(t, registry.KeepConfAlive())
+	got, _ := c.redis.Get(key)
+	require.Equal(t, want, got)
+
+	require.NoError(t, other.publish("docker-01", stale))
+	require.NoError(t, registry.publish("docker-01", current))
+	got, _ = c.redis.Get(key)
+	require.Equal(t, want, got)
+	require.Equal(t, 300*time.Second, c.redis.TTL(key))
 }

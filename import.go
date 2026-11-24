@@ -61,6 +61,11 @@ func (im *traefikAPIImporter) run(ctx context.Context) {
 	if interval <= 0 {
 		interval = 15 * time.Second
 	}
+	// Only a successful import renews the imported configuration.
+	if ttl := time.Duration(im.config.RedisTTL) * time.Second; ttl > 0 && interval > ttl/3 {
+		log.Warn().Msgf("import interval %s exceeds a third of the Redis TTL; importing every %s", interval, ttl/3)
+		interval = ttl / 3
+	}
 	log.Info().Str("api", im.api.Redacted()).Str("peer", im.config.ImportName).Msgf("importing Traefik routers every %s", interval)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -91,7 +96,9 @@ func (im *traefikAPIImporter) fetch(ctx context.Context) ([]apiRouter, error) {
 	for page := 1; ; {
 		u := *im.api
 		u.Path = strings.TrimSuffix(u.Path, "/") + "/api/http/routers"
-		u.RawQuery = url.Values{"page": {strconv.Itoa(page)}, "per_page": {"100"}}.Encode()
+		// Large pages keep the list consistent: routers that change between
+		// page requests shift the following pages.
+		u.RawQuery = url.Values{"page": {strconv.Itoa(page)}, "per_page": {"10000"}}.Encode()
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 		if err != nil {
 			return nil, err

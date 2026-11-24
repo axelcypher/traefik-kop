@@ -370,14 +370,18 @@ combines the configurations of all *other* hosts below the root key
 `traefik-<hostname>`, e.g. `traefik-docker-01/http/routers/...`. Point the
 local Traefik at that root key. Its own routes come from its Docker provider.
 
-- **Local routes win.** A route whose rule also exists on the local host stays
-  out of the view, so a host never forwards what it serves itself. This also
-  prevents requests from bouncing between hosts that publish the same rule.
+- **Local routes win.** A route that also exists on the local host stays out of
+  the view, so a host never forwards what it serves itself: HTTP routes with the
+  same rule, TCP routes with the same rule and entrypoints, UDP routes with the
+  same entrypoints. For HTTP this also prevents requests from bouncing between
+  hosts that publish the same rule.
 - **Routes on several hosts are balanced.** HTTP routes with the same rule and
   entrypoints on several other hosts become one router with a load balancer over
   all of them. There are no health checks: a stopped host keeps receiving its
-  share until its configuration expires. TCP and UDP routes keep the first host
-  by name.
+  share until its configuration expires. For TCP and UDP, the first host by name
+  wins.
+- **Names stay apart.** Services, middlewares and serversTransports that share a
+  name on several hosts but differ get the suffix `_<hostname>` in the view.
 - **Expiry.** Views resync every 10 seconds. Set `REDIS_TTL` so that a host that
   goes away drops out of the views; without a TTL its routes stay until it
   returns. kop renews its keys every third of the TTL. Leave room for a Sentinel
@@ -387,9 +391,10 @@ local Traefik at that root key. Its own routes come from its Docker provider.
   `KOP_SHARED_ROOT=false` if nothing reads it. Never point a host's own Traefik
   at the shared root: it would forward its own routes to itself.
 
-kop only writes to Redis when a configuration changes. It also checks its keys
-on every renewal and restores them if Redis lost them, e.g. after a Sentinel
-failover to a replica that missed recent writes.
+kop only writes to Redis when a configuration changes. On every renewal it also
+compares its keys with what it published and rewrites them if Redis lost them or
+holds older values, e.g. after a Sentinel failover to a replica that missed
+recent writes.
 
 ### Traefik and Valkey/Redis setup
 
@@ -449,7 +454,8 @@ never in the shared root key, which that Traefik may read itself.
 
 Enable the import on every kop instance that should keep it fresh; all of them
 publish the same pseudo host. If the API cannot be reached, the last import
-stays until it expires with `REDIS_TTL`.
+stays until it expires with `REDIS_TTL`. Only successful imports renew it, so kop
+imports at least every third of the TTL.
 
 ## Namespaces
 

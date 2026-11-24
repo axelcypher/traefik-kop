@@ -259,9 +259,9 @@ func (s *RedisStore) store(conf dynamic.Configuration) error {
 }
 
 // Renew published keys before they expire, or restore the configuration if Redis
-// lost any part of it (restart, flush, or a Sentinel failover to a replica that
-// missed recent writes). Only touch keys in this instance's last published
-// configuration.
+// lost or changed any part of it: a restart, a flush, an older snapshot, or a
+// Sentinel failover to a replica that missed recent writes. Only touch keys in
+// this instance's last published configuration.
 func (s *RedisStore) KeepConfAlive() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -270,28 +270,45 @@ func (s *RedisStore) KeepConfAlive() error {
 	}
 
 	ctx := context.Background()
-	keys := append(collectKeys(s.lastKV), s.sk("kop_last_update"))
-	pipe := s.client.Pipeline()
-	present := make([]func() bool, 0, len(keys))
-	for _, key := range keys {
-		if s.TTL > 0 {
-			cmd := pipe.PExpire(ctx, key, s.TTL)
-			present = append(present, cmd.Val)
-		} else {
-			cmd := pipe.Exists(ctx, key)
-			present = append(present, func() bool { return cmd.Val() > 0 })
+	keys := collectKeys(s.lastKV)
+	if len(keys) > 0 {
+		values, err := s.client.MGet(ctx, keys...).Result()
+		if err != nil {
+			return errors.Wrap(err, "failed to check Redis configuration")
 		}
-	}
-	if _, err := pipe.Exec(ctx); err != nil {
-		return errors.Wrap(err, "failed to renew Redis configuration")
-	}
-	for i, ok := range present {
-		if !ok() {
-			log.Warn().Str("root", s.root).Str("key", keys[i]).Msg("Redis lost published configuration. Pushing last known configuration")
-			return s.store(*s.lastConfig)
+		for i, value := range values {
+			if value == nil || fmt.Sprint(value) != fmt.Sprint(s.lastKV[keys[i]]) {
+				log.Warn().Str("root", s.root).Str("key", keys[i]).Msg("Redis lost published configuration. Pushing last known configuration")
+				return s.store(*s.lastConfig)
+			}
 		}
 	}
 
+	sentinel := s.sk("kop_last_update")
+	if s.TTL <= 0 {
+		exists, err := s.client.Exists(ctx, sentinel).Result()
+		if err != nil {
+			return errors.Wrap(err, "failed to check Redis sentinel")
+		}
+		if exists == 0 {
+			return s.store(*s.lastConfig)
+		}
+		return nil
+	}
+
+	pipe := s.client.Pipeline()
+	commands := make([]*redis.BoolCmd, 0, len(keys)+1)
+	for _, key := range append(keys, sentinel) {
+		commands = append(commands, pipe.PExpire(ctx, key, s.TTL))
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return errors.Wrap(err, "failed to renew Redis configuration TTL")
+	}
+	for _, command := range commands {
+		if !command.Val() {
+			return s.store(*s.lastConfig) // expired in the meantime
+		}
+	}
 	return nil
 }
 

@@ -12,7 +12,7 @@
 
 ### Fixes
 
-- Write Redis only when the configuration changes; restore lost keys on renewal also without a TTL
+- Write Redis only when the configuration changes; on renewal, restore keys that Redis lost or holds with older values, also without a TTL
 - Log failed Redis writes and retry them on the next refresh instead of panicking
 - Publish one ingress router per rule, preferring the TLS router over an HTTP router that only redirects
 

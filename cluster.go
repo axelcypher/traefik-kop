@@ -72,23 +72,16 @@ func newPeerRegistry(client *redis.Client, self string, ttl int) *peerRegistry {
 }
 
 // publish shares conf as the configuration of name and notifies the peers if
-// it changed. An unchanged configuration only renews its TTL.
+// Redis held something else. An unchanged configuration only renews its TTL.
 func (r *peerRegistry) publish(name string, conf dynamic.Configuration) error {
 	data, err := json.Marshal(conf)
 	if err != nil {
 		return fmt.Errorf("failed to encode configuration of %s: %w", name, err)
 	}
-
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	ctx := context.Background()
-	if bytes.Equal(r.last[name], data) {
-		stored, err := r.renew(ctx, name)
-		if err != nil || stored {
-			return err
-		}
-	}
-	return r.write(ctx, name, data)
+	r.last[name] = data
+	return r.ensure(context.Background(), name, data)
 }
 
 // KeepConfAlive renews the configuration of this instance, or restores it.
@@ -99,36 +92,37 @@ func (r *peerRegistry) KeepConfAlive() error {
 	if !ok {
 		return nil
 	}
-	ctx := context.Background()
-	stored, err := r.renew(ctx, r.self)
-	if err != nil || stored {
-		return err
-	}
-	log.Warn().Str("peer", r.self).Msg("Redis lost shared configuration. Pushing last known configuration")
-	return r.write(ctx, r.self, data)
+	return r.ensure(context.Background(), r.self, data)
 }
 
-// write requires mu to be held by the caller.
-func (r *peerRegistry) write(ctx context.Context, name string, data []byte) error {
-	if err := r.client.Set(ctx, peerKeyPrefix+name, data, r.ttl).Err(); err != nil {
+// ensure stores data as the configuration of name unless Redis already holds
+// it, in which case it renews the TTL. Comparing with Redis rather than with
+// the last write also repairs values that a failover or another instance
+// replaced. It requires mu to be held by the caller.
+func (r *peerRegistry) ensure(ctx context.Context, name string, data []byte) error {
+	key := peerKeyPrefix + name
+	stored, err := r.client.Get(ctx, key).Bytes()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return fmt.Errorf("failed to read shared configuration of %s: %w", name, err)
+	}
+	if bytes.Equal(stored, data) {
+		if r.ttl <= 0 {
+			return nil
+		}
+		renewed, err := r.client.PExpire(ctx, key, r.ttl).Result()
+		if err != nil || renewed {
+			return err
+		}
+	}
+
+	if err := r.client.Set(ctx, key, data, r.ttl).Err(); err != nil {
 		return fmt.Errorf("failed to share configuration of %s: %w", name, err)
 	}
-	r.last[name] = data
 	log.Info().Str("peer", name).Msg("shared configuration with peers")
 	if err := r.client.Publish(ctx, peerChannel, name).Err(); err != nil {
 		return fmt.Errorf("failed to notify peers about %s: %w", name, err)
 	}
 	return nil
-}
-
-// renew reports whether the configuration of name is still stored.
-func (r *peerRegistry) renew(ctx context.Context, name string) (bool, error) {
-	key := peerKeyPrefix + name
-	if r.ttl > 0 {
-		return r.client.PExpire(ctx, key, r.ttl).Result()
-	}
-	n, err := r.client.Exists(ctx, key).Result()
-	return n > 0, err
 }
 
 // load returns all shared configurations by peer name.
@@ -258,12 +252,15 @@ func (v *viewBuilder) KeepConfAlive() error {
 // buildView combines the configurations of all peers for a host whose own
 // published configuration is own.
 //
-//   - Routes whose rule (or UDP router name) also exists locally are left out,
-//     so the local Traefik serves them itself. This also prevents forwarding
-//     loops between hosts that publish the same rule.
+//   - Routes that also exist locally are left out, so the local Traefik serves
+//     them itself: HTTP routes with the same rule, TCP routes with the same rule
+//     and entrypoints, UDP routes with the same entrypoints. For HTTP, this also
+//     prevents forwarding loops between hosts that publish the same rule.
 //   - HTTP routes with the same rule and entrypoints on several peers become one
-//     router that balances over all of them. TCP and UDP keep the first peer by
-//     name.
+//     router that balances over all of them. For TCP and UDP, the first peer by
+//     name wins.
+//   - Services, middlewares and serversTransports that share a name across peers
+//     but differ get the suffix _<peer>, and references follow.
 func buildView(own dynamic.Configuration, peers map[string]dynamic.Configuration) dynamic.Configuration {
 	view := dynamic.Configuration{
 		HTTP: &dynamic.HTTPConfiguration{
@@ -284,12 +281,6 @@ func buildView(own dynamic.Configuration, peers map[string]dynamic.Configuration
 		},
 	}
 
-	names := make([]string, 0, len(peers))
-	for name := range peers {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-
 	localHTTP, localTCP, localUDP := map[string]bool{}, map[string]bool{}, map[string]bool{}
 	if own.HTTP != nil {
 		for _, router := range own.HTTP.Routers {
@@ -298,26 +289,31 @@ func buildView(own dynamic.Configuration, peers map[string]dynamic.Configuration
 	}
 	if own.TCP != nil {
 		for _, router := range own.TCP.Routers {
-			localTCP[router.Rule] = true
+			localTCP[routeGroup(router.Rule, router.EntryPoints)] = true
 		}
 	}
 	if own.UDP != nil {
-		for name := range own.UDP.Routers {
-			localUDP[stripDocker(name)] = true
+		for _, router := range own.UDP.Routers {
+			localUDP[routeGroup("", router.EntryPoints)] = true
 		}
 	}
 
 	type route struct {
 		peer   string
 		name   string
-		router *dynamic.Router
+		router *dynamic.Router // as published by the peer
+		copied *dynamic.Router // with references to the view's names
 	}
 	var groups []string
 	httpRoutes := make(map[string][]route)
-	tcpRules := make(map[string]bool)
+	tcpSeen, udpSeen := map[string]bool{}, map[string]bool{}
+	renames := make(map[string]*peerNames, len(peers))
 
-	for _, peer := range names {
+	for _, peer := range sortedKeys(peers) {
 		conf := peers[peer]
+		names := addPeerObjects(&view, peer, conf)
+		renames[peer] = names
+
 		if http := conf.HTTP; http != nil {
 			for _, name := range sortedKeys(http.Routers) {
 				router := http.Routers[name]
@@ -325,7 +321,7 @@ func buildView(own dynamic.Configuration, peers map[string]dynamic.Configuration
 					log.Debug().Str("peer", peer).Str("router", name).Msg("view: local route takes precedence")
 					continue
 				}
-				key := routeGroup(router)
+				key := routeGroup(router.Rule, router.EntryPoints)
 				routes, seen := httpRoutes[key]
 				if !seen {
 					groups = append(groups, key)
@@ -333,48 +329,39 @@ func buildView(own dynamic.Configuration, peers map[string]dynamic.Configuration
 				if len(routes) > 0 && routes[len(routes)-1].peer == peer {
 					continue // one route per peer and group
 				}
-				httpRoutes[key] = append(routes, route{peer, name, router})
-			}
-			for _, name := range sortedKeys(http.Services) {
-				addService(view.HTTP.Services, stripDocker(name), http.Services[name])
-			}
-			for _, name := range sortedKeys(http.Middlewares) {
-				addFirst(view.HTTP.Middlewares, stripDocker(name), http.Middlewares[name])
-			}
-			for _, name := range sortedKeys(http.ServersTransports) {
-				addFirst(view.HTTP.ServersTransports, name, http.ServersTransports[name])
+				copied := router.DeepCopy()
+				copied.Service = renameRef(copied.Service, names.services)
+				copied.Middlewares = renameRefs(copied.Middlewares, names.middlewares)
+				httpRoutes[key] = append(routes, route{peer, name, router, copied})
 			}
 		}
 
 		if tcp := conf.TCP; tcp != nil {
 			for _, name := range sortedKeys(tcp.Routers) {
 				router := tcp.Routers[name]
-				if localTCP[router.Rule] || tcpRules[router.Rule] {
+				key := routeGroup(router.Rule, router.EntryPoints)
+				if localTCP[key] || tcpSeen[key] {
 					continue
 				}
-				tcpRules[router.Rule] = true
-				addFirst(view.TCP.Routers, uniqueName(view.TCP.Routers, stripDocker(name), peer), router)
-			}
-			for _, name := range sortedKeys(tcp.Services) {
-				addFirst(view.TCP.Services, stripDocker(name), tcp.Services[name])
-			}
-			for _, name := range sortedKeys(tcp.Middlewares) {
-				addFirst(view.TCP.Middlewares, stripDocker(name), tcp.Middlewares[name])
-			}
-			for _, name := range sortedKeys(tcp.ServersTransports) {
-				addFirst(view.TCP.ServersTransports, name, tcp.ServersTransports[name])
+				tcpSeen[key] = true
+				copied := router.DeepCopy()
+				copied.Service = renameRef(copied.Service, names.tcpServices)
+				copied.Middlewares = renameRefs(copied.Middlewares, names.tcpMiddlewares)
+				view.TCP.Routers[uniqueName(view.TCP.Routers, stripDocker(name), peer)] = copied
 			}
 		}
 
 		if udp := conf.UDP; udp != nil {
 			for _, name := range sortedKeys(udp.Routers) {
-				if localUDP[stripDocker(name)] {
+				router := udp.Routers[name]
+				key := routeGroup("", router.EntryPoints)
+				if localUDP[key] || udpSeen[key] {
 					continue
 				}
-				addFirst(view.UDP.Routers, stripDocker(name), udp.Routers[name])
-			}
-			for _, name := range sortedKeys(udp.Services) {
-				addFirst(view.UDP.Services, stripDocker(name), udp.Services[name])
+				udpSeen[key] = true
+				copied := router.DeepCopy()
+				copied.Service = renameRef(copied.Service, names.udpServices)
+				view.UDP.Routers[uniqueName(view.UDP.Routers, stripDocker(name), peer)] = copied
 			}
 		}
 	}
@@ -382,7 +369,7 @@ func buildView(own dynamic.Configuration, peers map[string]dynamic.Configuration
 	for _, key := range groups {
 		group := httpRoutes[key]
 		primary := group[0]
-		router := primary.router.DeepCopy()
+		router := primary.copied
 		if len(group) > 1 {
 			backends := make([]backend, len(group))
 			for i, r := range group {
@@ -393,9 +380,9 @@ func buildView(own dynamic.Configuration, peers map[string]dynamic.Configuration
 				}
 			}
 			if balanced := balanceBackends(backends); balanced != nil {
-				name := "lb_" + stripDocker(primary.name)
-				view.HTTP.Services[name] = balanced
-				router.Service = name
+				lb := balanced.LoadBalancer
+				lb.ServersTransport = renameRef(lb.ServersTransport, renames[primary.peer].transports)
+				router.Service = addRenamed(view.HTTP.Services, "lb_"+stripDocker(primary.name), primary.peer, balanced)
 			} else {
 				log.Debug().Str("rule", router.Rule).Str("peer", primary.peer).Msg("view: cannot balance over peers with the same rule; using the first peer")
 			}
@@ -406,11 +393,97 @@ func buildView(own dynamic.Configuration, peers map[string]dynamic.Configuration
 	return view
 }
 
-// routeGroup identifies HTTP routes that compete for the same requests.
-func routeGroup(router *dynamic.Router) string {
-	entryPoints := append([]string(nil), router.EntryPoints...)
-	sort.Strings(entryPoints)
-	return router.Rule + "\x00" + strings.Join(entryPoints, ",")
+// peerNames maps the names of a peer's objects to their names in the view.
+type peerNames struct {
+	services, middlewares, transports          map[string]string
+	tcpServices, tcpMiddlewares, tcpTransports map[string]string
+	udpServices                                map[string]string
+}
+
+// addPeerObjects adds the services, middlewares and serversTransports of a
+// peer to the view and returns the names they got.
+func addPeerObjects(view *dynamic.Configuration, peer string, conf dynamic.Configuration) *peerNames {
+	n := &peerNames{
+		services: map[string]string{}, middlewares: map[string]string{}, transports: map[string]string{},
+		tcpServices: map[string]string{}, tcpMiddlewares: map[string]string{}, tcpTransports: map[string]string{},
+		udpServices: map[string]string{},
+	}
+	if http := conf.HTTP; http != nil {
+		for _, name := range sortedKeys(http.ServersTransports) {
+			n.transports[name] = addRenamed(view.HTTP.ServersTransports, name, peer, http.ServersTransports[name].DeepCopy())
+		}
+		for _, name := range sortedKeys(http.Services) {
+			svc := http.Services[name].DeepCopy()
+			if svc.LoadBalancer != nil {
+				svc.LoadBalancer.ServersTransport = renameRef(svc.LoadBalancer.ServersTransport, n.transports)
+			}
+			n.services[stripDocker(name)] = addRenamed(view.HTTP.Services, stripDocker(name), peer, svc)
+		}
+		for _, name := range sortedKeys(http.Middlewares) {
+			n.middlewares[stripDocker(name)] = addRenamed(view.HTTP.Middlewares, stripDocker(name), peer, http.Middlewares[name].DeepCopy())
+		}
+	}
+	if tcp := conf.TCP; tcp != nil {
+		for _, name := range sortedKeys(tcp.ServersTransports) {
+			n.tcpTransports[name] = addRenamed(view.TCP.ServersTransports, name, peer, tcp.ServersTransports[name].DeepCopy())
+		}
+		for _, name := range sortedKeys(tcp.Services) {
+			svc := tcp.Services[name].DeepCopy()
+			if svc.LoadBalancer != nil {
+				svc.LoadBalancer.ServersTransport = renameRef(svc.LoadBalancer.ServersTransport, n.tcpTransports)
+			}
+			n.tcpServices[stripDocker(name)] = addRenamed(view.TCP.Services, stripDocker(name), peer, svc)
+		}
+		for _, name := range sortedKeys(tcp.Middlewares) {
+			n.tcpMiddlewares[stripDocker(name)] = addRenamed(view.TCP.Middlewares, stripDocker(name), peer, tcp.Middlewares[name].DeepCopy())
+		}
+	}
+	if udp := conf.UDP; udp != nil {
+		for _, name := range sortedKeys(udp.Services) {
+			n.udpServices[stripDocker(name)] = addRenamed(view.UDP.Services, stripDocker(name), peer, udp.Services[name].DeepCopy())
+		}
+	}
+	return n
+}
+
+// addRenamed adds value as name, or as name_peer if the view already holds a
+// different value under name. It returns the name used.
+func addRenamed[T any](m map[string]*T, name string, peer string, value *T) string {
+	if existing, ok := m[name]; ok {
+		if reflect.DeepEqual(existing, value) {
+			return name
+		}
+		name += "_" + peer
+	}
+	m[name] = value
+	return name
+}
+
+// renameRef maps a reference to an object of the same peer to its view name.
+// References to other providers (name@provider) stay as they are.
+func renameRef(ref string, names map[string]string) string {
+	if renamed, ok := names[stripDocker(ref)]; ok {
+		return renamed
+	}
+	return ref
+}
+
+func renameRefs(refs []string, names map[string]string) []string {
+	if refs == nil {
+		return nil
+	}
+	renamed := make([]string, len(refs))
+	for i, ref := range refs {
+		renamed[i] = renameRef(ref, names)
+	}
+	return renamed
+}
+
+// routeGroup identifies routes that compete for the same requests.
+func routeGroup(rule string, entryPoints []string) string {
+	sorted := append([]string(nil), entryPoints...)
+	sort.Strings(sorted)
+	return rule + "\x00" + strings.Join(sorted, ",")
 }
 
 type backend struct {
@@ -449,34 +522,6 @@ func balanceBackends(backends []backend) *dynamic.Service {
 		}
 	}
 	return balanced
-}
-
-// addService adds svc, combining the servers of load balancers that share a
-// name across peers (as published by kop's load balancer merging).
-func addService(services map[string]*dynamic.Service, name string, svc *dynamic.Service) {
-	existing, ok := services[name]
-	if !ok {
-		services[name] = svc.DeepCopy()
-		return
-	}
-	if existing.LoadBalancer == nil || svc.LoadBalancer == nil {
-		return
-	}
-	for _, server := range svc.LoadBalancer.Servers {
-		known := false
-		for _, s := range existing.LoadBalancer.Servers {
-			known = known || s.URL == server.URL
-		}
-		if !known {
-			existing.LoadBalancer.Servers = append(existing.LoadBalancer.Servers, server)
-		}
-	}
-}
-
-func addFirst[T any](m map[string]T, name string, value T) {
-	if _, ok := m[name]; !ok {
-		m[name] = value
-	}
 }
 
 // uniqueName returns name, or name_peer if a different peer already uses it.
