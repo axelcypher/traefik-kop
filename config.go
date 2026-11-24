@@ -34,6 +34,25 @@ type Config struct {
 	// Redis Sentinel
 	RedisSentinelAddrs  []string
 	RedisSentinelMaster string
+	RedisSentinelUser   string
+	RedisSentinelPass   string
+
+	// DisableSharedRoot stops publishing to the shared "traefik" root key,
+	// which holds the routes of all hosts.
+	DisableSharedRoot bool
+
+	// HTTP ingress mode (DefaultPort > 0)
+	IngressEntryPoints        []string
+	IngressVerifyBackendCerts bool
+
+	// View publishes the routes of all other hosts below "traefik-<Hostname>".
+	View bool
+
+	// Import routers from another Traefik's API as a pseudo host for the views.
+	ImportTraefikAPI string
+	ImportName       string
+	ImportBackend    string
+	ImportInterval   int64
 
 	PollInterval int64
 	Namespace    []string

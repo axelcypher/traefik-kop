@@ -53,12 +53,11 @@ func newDockerProvider(config Config) *docker.Provider {
 	return dp
 }
 
-// createConfigHandler returns a function that processes new traefik configurations
-func createConfigHandler(config Config, store TraefikStore, dp *docker.Provider, dockerClient client.APIClient) func(conf dynamic.Configuration) {
+// createConfigHandler returns a function that processes new traefik configurations.
+// published receives each processed configuration, e.g. to share it with peers.
+func createConfigHandler(config Config, store TraefikStore, dp *docker.Provider, dockerClient client.APIClient, published ...func(dynamic.Configuration)) func(conf dynamic.Configuration) {
 	return func(conf dynamic.Configuration) {
-		// logrus.Printf("got new conf..\n")
-		// fmt.Printf("%s\n", dumpJson(conf))
-		log.Info().Msg("refreshing traefik-kop configuration")
+		log.Debug().Msg("processing traefik-kop configuration")
 
 		dc := &dockerCache{
 			client:  dockerClient,
@@ -84,17 +83,30 @@ func createConfigHandler(config Config, store TraefikStore, dp *docker.Provider,
 			conf.HTTP = buildHTTPIngress(dc, http, config)
 		}
 
-		err := store.Store(conf)
-		if err != nil {
-			panic(err)
+		if !config.DisableSharedRoot {
+			// A failed write is retried on the next refresh, e.g. after a Sentinel failover.
+			if err := store.Store(conf); err != nil {
+				log.Error().Err(err).Msg("failed to publish configuration to redis")
+			}
+		}
+		for _, fn := range published {
+			fn(conf)
 		}
 	}
 }
 
 // Start the main traefik-kop run-loop
 func Start(config Config) {
-	if config.DefaultPort > 0 && !ingressHostname.MatchString(config.Hostname) {
-		log.Fatal().Msg("KOP_HOSTNAME must start with a lowercase letter or digit and use only lowercase letters, digits, dots and hyphens when KOP_DEFAULT_PORT is enabled")
+	if (config.DefaultPort > 0 || config.View) && !ingressHostname.MatchString(config.Hostname) {
+		log.Fatal().Msg("KOP_HOSTNAME must start with a lowercase letter or digit and use only lowercase letters, digits, dots and hyphens when KOP_DEFAULT_PORT or KOP_VIEW is enabled")
+	}
+	if config.ImportTraefikAPI != "" {
+		if !ingressHostname.MatchString(config.ImportName) || config.ImportName == config.Hostname {
+			log.Fatal().Msg("KOP_IMPORT_NAME must differ from KOP_HOSTNAME and use only lowercase letters, digits, dots and hyphens")
+		}
+		if u, err := url.Parse(config.ImportBackend); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			log.Fatal().Msg("KOP_IMPORT_BACKEND must be the http(s) URL of the imported Traefik, e.g. https://10.8.0.10:443")
+		}
 	}
 
 	dockerClient, err := createDockerClient(config.DockerHost)
@@ -131,7 +143,18 @@ func Start(config Config) {
 	if err != nil {
 		log.Fatal().Msgf("invalid redis TLS configuration: %s", err)
 	}
-	store := NewRedisStore(config.Hostname, config.RedisAddr, config.RedisTTL, config.RedisUser, config.RedisPass, config.RedisDB, config.RedisSentinelAddrs, config.RedisSentinelMaster, redisTLS)
+	redisClient := newRedisClient(RedisOptions{
+		Addr:           config.RedisAddr,
+		User:           config.RedisUser,
+		Pass:           config.RedisPass,
+		DB:             config.RedisDB,
+		SentinelAddrs:  config.RedisSentinelAddrs,
+		SentinelMaster: config.RedisSentinelMaster,
+		SentinelUser:   config.RedisSentinelUser,
+		SentinelPass:   config.RedisSentinelPass,
+		TLS:            redisTLS,
+	})
+	store := newRedisStore(redisClient, config.Hostname, defaultRootKey, config.RedisTTL)
 	err = store.Ping()
 	if err != nil {
 		if len(config.RedisSentinelAddrs) > 0 {
@@ -150,15 +173,17 @@ func Start(config Config) {
 
 	ctx := context.Background()
 	routinesPool := safe.NewPool(ctx)
+	published, peerKeepAlive := startPeering(routinesPool, config, redisClient)
+	keepAlive := append(keepAliveGroup{store}, peerKeepAlive...)
 	if config.RedisTTL > 0 {
 		// Renew independently of Docker polling, including when polling is disabled.
 		interval := time.Duration(config.RedisTTL) * time.Second / 3
 		routinesPool.GoCtx(func(ctx context.Context) {
-			keepStoreAlive(ctx, store, interval)
+			keepStoreAlive(ctx, keepAlive, interval)
 		})
 	}
 
-	handleConfigChange := createConfigHandler(config, store, dp, dockerClient)
+	handleConfigChange := createConfigHandler(config, store, dp, dockerClient, published)
 	refresh := &configurationRefresh{handle: handleConfigChange}
 
 	pollingDockerProvider := newDockerProvider(config)
@@ -166,7 +191,7 @@ func Start(config Config) {
 	poller := NewPollingProvider(
 		time.Second*time.Duration(config.PollInterval),
 		pollingDockerProvider,
-		store,
+		keepAlive,
 	)
 	poller.refreshLabels = refresh.Refresh
 	multiProvider := NewMultiProvider([]provider.Provider{
@@ -187,7 +212,7 @@ func Start(config Config) {
 	select {} // go forever
 }
 
-func keepStoreAlive(ctx context.Context, store TraefikStore, interval time.Duration) {
+func keepStoreAlive(ctx context.Context, store keepAliver, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {

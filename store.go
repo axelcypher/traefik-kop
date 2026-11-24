@@ -35,48 +35,85 @@ func collectKeys(m interface{}) []string {
 	return set
 }
 
+// defaultRootKey is the key prefix read by Traefik's Redis provider by default.
+const defaultRootKey = "traefik"
+
 type RedisStore struct {
 	Hostname string
 	TTL      time.Duration // 0 means no TTL
 
+	root  string // key prefix, e.g. "traefik" or "traefik-<host>" for a host view
+	quiet bool   // log published services at debug level
+
 	mu         sync.Mutex // serializes configuration writes and TTL renewal
 	client     *redis.Client
 	lastConfig *dynamic.Configuration
+	lastKV     map[string]interface{}
+}
+
+// RedisOptions describes how to connect to Redis/Valkey, directly or via Sentinel.
+type RedisOptions struct {
+	Addr string
+	User string
+	Pass string
+	DB   int
+
+	SentinelAddrs  []string
+	SentinelMaster string
+	SentinelUser   string
+	SentinelPass   string
+
+	TLS *tls.Config
+}
+
+func newRedisClient(o RedisOptions) *redis.Client {
+	if len(o.SentinelAddrs) > 0 && o.SentinelMaster != "" {
+		log.Info().Msgf("connecting to redis via sentinel (master=%s, sentinels=%v)", o.SentinelMaster, o.SentinelAddrs)
+		return redis.NewFailoverClient(&redis.FailoverOptions{
+			MasterName:       o.SentinelMaster,
+			SentinelAddrs:    o.SentinelAddrs,
+			SentinelUsername: o.SentinelUser,
+			SentinelPassword: o.SentinelPass,
+			DisableIdentity:  true,
+			Username:         o.User,
+			Password:         o.Pass,
+			DB:               o.DB,
+			TLSConfig:        o.TLS,
+		})
+	}
+	log.Info().Msgf("connecting to redis at %s", o.Addr)
+	return redis.NewClient(&redis.Options{
+		DisableIdentity: true,
+		Addr:            o.Addr,
+		Username:        o.User,
+		Password:        o.Pass,
+		DB:              o.DB,
+		TLSConfig:       o.TLS,
+	})
 }
 
 func NewRedisStore(hostname string, addr string, ttl int, user string, pass string, db int, sentinelAddrs []string, sentinelMaster string, tlsConf *tls.Config) TraefikStore {
-	var client *redis.Client
+	client := newRedisClient(RedisOptions{
+		Addr:           addr,
+		User:           user,
+		Pass:           pass,
+		DB:             db,
+		SentinelAddrs:  sentinelAddrs,
+		SentinelMaster: sentinelMaster,
+		TLS:            tlsConf,
+	})
+	return newRedisStore(client, hostname, defaultRootKey, ttl)
+}
 
-	if len(sentinelAddrs) > 0 && sentinelMaster != "" {
-		log.Info().Msgf("creating new redis store via sentinel (master=%s, sentinels=%v) for hostname %s with %dsec TTL", sentinelMaster, sentinelAddrs, hostname, ttl)
-		client = redis.NewFailoverClient(&redis.FailoverOptions{
-			MasterName:      sentinelMaster,
-			SentinelAddrs:   sentinelAddrs,
-			DisableIdentity: true,
-			Username:        user,
-			Password:        pass,
-			DB:              db,
-			TLSConfig:       tlsConf,
-		})
-	} else {
-		log.Info().Msgf("creating new redis store at %s for hostname %s with %dsec TTL", addr, hostname, ttl)
-		client = redis.NewClient(&redis.Options{
-			ClientName:      "",
-			DisableIdentity: true,
-			Addr:            addr,
-			Username:        user,
-			Password:        pass,
-			DB:              db,
-			TLSConfig:       tlsConf,
-		})
-	}
-
-	store := &RedisStore{
+// newRedisStore publishes configurations of the given host below root.
+func newRedisStore(client *redis.Client, hostname string, root string, ttl int) *RedisStore {
+	log.Info().Msgf("creating redis store %s/ for hostname %s with %dsec TTL", root, hostname, ttl)
+	return &RedisStore{
 		Hostname: hostname,
 		TTL:      time.Duration(ttl) * time.Second,
+		root:     root,
 		client:   client,
 	}
-	return store
 }
 
 func (s *RedisStore) Ping() error {
@@ -86,7 +123,20 @@ func (s *RedisStore) Ping() error {
 // sk returns the 'set key' for keeping track of our services/routers/middlewares
 // e.g., traefik_http_routers@culture.local
 func (s *RedisStore) sk(b string) string {
-	return fmt.Sprintf("traefik_%s@%s", b, s.Hostname)
+	return fmt.Sprintf("%s_%s@%s", s.root, b, s.Hostname)
+}
+
+// configToKV flattens conf into keys below the store's root.
+func (s *RedisStore) configToKV(conf dynamic.Configuration) (map[string]interface{}, error) {
+	kv, err := ConfigToKV(conf)
+	if err != nil || s.root == defaultRootKey {
+		return kv, err
+	}
+	rooted := make(map[string]interface{}, len(kv))
+	for k, v := range kv {
+		rooted[s.root+strings.TrimPrefix(k, defaultRootKey)] = v
+	}
+	return rooted, nil
 }
 
 func (s *RedisStore) Get(key string) (string, error) {
@@ -122,11 +172,21 @@ func (s *RedisStore) Gets(key string) (map[string]string, error) {
 // traefik/http/services/gitea/loadBalancer/servers/0/url
 // traefik/tcp/services/gitea-ssh/loadBalancer/servers/0/address
 // traefik/udp/services/helloudp/loadBalancer/servers/0/address
-var svcAddrRe = regexp.MustCompile(`^traefik/(tcp|udp|http)/services/([^/]+)/loadBalancer/servers/\d+/(address|url)$`)
+var svcAddrRe = regexp.MustCompile(`^[^/]+/(tcp|udp|http)/services/([^/]+)/loadBalancer/servers/\d+/(address|url)$`)
 
+// Store publishes conf unless it matches the last published configuration.
+// KeepConfAlive repairs keys that were lost in the meantime.
 func (s *RedisStore) Store(conf dynamic.Configuration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	kv, err := s.configToKV(conf)
+	if err != nil {
+		return err
+	}
+	if s.lastConfig != nil && reflect.DeepEqual(kv, s.lastKV) {
+		log.Debug().Str("root", s.root).Msg("configuration unchanged, skipping redis update")
+		return nil
+	}
 	return s.store(conf)
 }
 
@@ -135,13 +195,15 @@ func (s *RedisStore) store(conf dynamic.Configuration) error {
 	s.removeOldKeys(conf.HTTP.Middlewares, "http_middlewares")
 	s.removeOldKeys(conf.HTTP.Routers, "http_routers")
 	s.removeOldKeys(conf.HTTP.Services, "http_services")
+	s.removeOldKeys(conf.HTTP.ServersTransports, "http_serversTransports")
 	s.removeOldKeys(conf.TCP.Middlewares, "tcp_middlewares")
 	s.removeOldKeys(conf.TCP.Routers, "tcp_routers")
 	s.removeOldKeys(conf.TCP.Services, "tcp_services")
+	s.removeOldKeys(conf.TCP.ServersTransports, "tcp_serversTransports")
 	s.removeOldKeys(conf.UDP.Routers, "udp_routers")
 	s.removeOldKeys(conf.UDP.Services, "udp_services")
 
-	kv, err := ConfigToKV(conf)
+	kv, err := s.configToKV(conf)
 	if err != nil {
 		return err
 	}
@@ -153,7 +215,11 @@ func (s *RedisStore) store(conf dynamic.Configuration) error {
 		log.Debug().Msgf("writing %s = %s", k, v)
 
 		if matches := svcAddrRe.FindStringSubmatch(k); matches != nil {
-			log.Info().Str("service", matches[2]).Str("service-type", matches[1]).Msgf("publishing %s", v)
+			event := log.Info()
+			if s.quiet {
+				event = log.Debug()
+			}
+			event.Str("root", s.root).Str("service", matches[2]).Str("service-type", matches[1]).Msgf("publishing %s", v)
 		}
 
 		if err := s.client.Set(context.Background(), k, v, s.TTL).Err(); err != nil {
@@ -171,9 +237,11 @@ func (s *RedisStore) store(conf dynamic.Configuration) error {
 	s.swapKeys(s.sk("http_middlewares"))
 	s.swapKeys(s.sk("http_routers"))
 	s.swapKeys(s.sk("http_services"))
+	s.swapKeys(s.sk("http_serversTransports"))
 	s.swapKeys(s.sk("tcp_middlewares"))
 	s.swapKeys(s.sk("tcp_routers"))
 	s.swapKeys(s.sk("tcp_services"))
+	s.swapKeys(s.sk("tcp_serversTransports"))
 	s.swapKeys(s.sk("udp_routers"))
 	s.swapKeys(s.sk("udp_services"))
 
@@ -184,12 +252,16 @@ func (s *RedisStore) store(conf dynamic.Configuration) error {
 
 	// Store a copy of the configuration in case redis restarts
 	s.lastConfig = conf.DeepCopy()
+	s.lastKV = kv
+	log.Info().Str("root", s.root).Int("keys", len(kv)).Msg("published configuration to redis")
 
 	return nil
 }
 
 // Renew published keys before they expire, or restore the configuration if Redis
-// lost it. Only touch keys in this instance's last published configuration.
+// lost any part of it (restart, flush, or a Sentinel failover to a replica that
+// missed recent writes). Only touch keys in this instance's last published
+// configuration.
 func (s *RedisStore) KeepConfAlive() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -198,33 +270,24 @@ func (s *RedisStore) KeepConfAlive() error {
 	}
 
 	ctx := context.Background()
-	exists, err := s.client.Exists(ctx, s.sk("kop_last_update")).Result()
-	if err != nil {
-		return errors.Wrap(err, "failed to check Redis sentinel")
-	}
-	if exists == 0 {
-		log.Warn().Msg("Redis configuration sentinel is missing. Pushing last known configuration")
-		return s.store(*s.lastConfig)
-	}
-	if s.TTL <= 0 {
-		return nil
-	}
-
-	kv, err := ConfigToKV(*s.lastConfig)
-	if err != nil {
-		return err
-	}
+	keys := append(collectKeys(s.lastKV), s.sk("kop_last_update"))
 	pipe := s.client.Pipeline()
-	commands := make([]*redis.BoolCmd, 0, len(kv)+1)
-	for key := range kv {
-		commands = append(commands, pipe.PExpire(ctx, key, s.TTL))
+	present := make([]func() bool, 0, len(keys))
+	for _, key := range keys {
+		if s.TTL > 0 {
+			cmd := pipe.PExpire(ctx, key, s.TTL)
+			present = append(present, cmd.Val)
+		} else {
+			cmd := pipe.Exists(ctx, key)
+			present = append(present, func() bool { return cmd.Val() > 0 })
+		}
 	}
-	commands = append(commands, pipe.PExpire(ctx, s.sk("kop_last_update"), s.TTL))
 	if _, err := pipe.Exec(ctx); err != nil {
-		return errors.Wrap(err, "failed to renew Redis configuration TTL")
+		return errors.Wrap(err, "failed to renew Redis configuration")
 	}
-	for _, command := range commands {
-		if !command.Val() {
+	for i, ok := range present {
+		if !ok() {
+			log.Warn().Str("root", s.root).Str("key", keys[i]).Msg("Redis lost published configuration. Pushing last known configuration")
 			return s.store(*s.lastConfig)
 		}
 	}
@@ -248,9 +311,7 @@ func (s *RedisStore) swapKeys(setkey string) error {
 // k returns the actual config key path
 // e.g., traefik/http/routers/nginx@docker
 func (s *RedisStore) k(sk, b string) string {
-	k := strings.ReplaceAll(fmt.Sprintf("traefik_%s", sk), "_", "/")
-	b = stripDocker(b)
-	return fmt.Sprintf("%s/%s", k, b)
+	return fmt.Sprintf("%s/%s/%s", s.root, strings.ReplaceAll(sk, "_", "/"), stripDocker(b))
 }
 
 func (s *RedisStore) removeKeys(setkey string, keys []string) error {
@@ -310,7 +371,7 @@ func (s *RedisStore) removeStaleServerKeys(kv map[string]interface{}, services i
 
 	for _, nameVal := range svcMap.MapKeys() {
 		name := stripDocker(nameVal.String())
-		prefix := fmt.Sprintf("traefik/%s/services/%s/loadBalancer/servers/", proto, name)
+		prefix := fmt.Sprintf("%s/%s/services/%s/loadBalancer/servers/", s.root, proto, name)
 
 		existingKeys, err := s.client.Keys(ctx, prefix+"*").Result()
 		if err != nil {
