@@ -39,6 +39,9 @@ them to a given `redis` instance. Simply configure your `traefik` node with a
   - [Load Balancer Merging](#load-balancer-merging)
   - [Service port binding](#service-port-binding)
   - [Forward HTTP routes to the Docker ingress](#forward-http-routes-to-the-docker-ingress)
+  - [Share routes between hosts (views)](#share-routes-between-hosts-views)
+    - [Traefik and Valkey/Redis setup](#traefik-and-valkeyredis-setup)
+    - [Import routes from another Traefik](#import-routes-from-another-traefik)
   - [Namespaces](#namespaces)
     - [Namespace via label prefix](#namespace-via-label-prefix)
   - [Docker API](#docker-api)
@@ -123,6 +126,14 @@ GLOBAL OPTIONS:
    --bind-interface value Network interface to derive bind IP (overrides auto-detect) [$BIND_INTERFACE]
    --skip-replace         Disable custom IP replacement (default: false) [$SKIP_REPLACE]
    --default-port value   Forward HTTP routes to the Docker ingress at BIND_IP on this HTTPS port [$KOP_DEFAULT_PORT]
+   --ingress-entrypoints value    Comma-separated entrypoints of forwarded HTTP routers (default: "websecure") [$KOP_INGRESS_ENTRYPOINTS]
+   --ingress-verify-backend-certs Verify the certificate of the receiving Traefik when forwarding HTTP routes (default: false) [$KOP_INGRESS_VERIFY_BACKEND_CERTS]
+   --shared-root                  Publish to the shared 'traefik' root key, which holds the routes of all hosts (default: true) [$KOP_SHARED_ROOT]
+   --view                         Publish the routes of all other hosts to the root key 'traefik-<hostname>' for the local Traefik (default: false) [$KOP_VIEW]
+   --import-traefik-api value     Import the HTTP routers of another Traefik from this API URL (e.g. http://10.8.0.10:9000) into the views [$KOP_IMPORT_TRAEFIK_API]
+   --import-name value            Peer name of the imported Traefik (default: "k3s") [$KOP_IMPORT_NAME]
+   --import-backend value         URL that forwarded requests for imported routers go to (e.g. https://10.8.0.10:443) [$KOP_IMPORT_BACKEND]
+   --import-interval value        Seconds between Traefik API imports (default: 15) [$KOP_IMPORT_INTERVAL]
    --redis-addr value     Redis address (default: "127.0.0.1:6379") [$REDIS_ADDR]
    --redis-user value     Redis username (default: "default") [$REDIS_USER]
    --redis-pass value     Redis password (if needed) [$REDIS_PASS]
@@ -136,6 +147,8 @@ GLOBAL OPTIONS:
    --redis-tls-insecure-skip-verify  Skip verification of the Redis server certificate (insecure) [$REDIS_TLS_INSECURE_SKIP_VERIFY]
    --redis-sentinel-addrs value   Comma-separated list of Redis Sentinel addresses (e.g., host1:26379,host2:26379) [$REDIS_SENTINEL_ADDRS]
    --redis-sentinel-master value  Redis Sentinel master name [$REDIS_SENTINEL_MASTER]
+   --redis-sentinel-user value    Username for the Sentinels (if needed) [$REDIS_SENTINEL_USER]
+   --redis-sentinel-pass value    Password for the Sentinels (if needed) [$REDIS_SENTINEL_PASS]
    --docker-host value            Docker endpoint (default: "unix:///var/run/docker.sock") [$DOCKER_ADDR]
    --docker-config value  Docker provider config (file must end in .yaml) [$DOCKER_CONFIG]
    --docker-prefix value  Docker label prefix [$DOCKER_PREFIX]
@@ -302,18 +315,141 @@ its specified port. For a router pointing to an external provider such as
 
 Published HTTP router names get a hostname prefix, so
 `traefik-traefik` becomes `docker-01_traefik-traefik`. Kop copies the
-rule and priority and points the router at its host backend. The incoming
-Host header and path reach the Docker ingress, which handles its own
+rule, rule syntax and priority and points the router at its host backend. The
+incoming Host header and path reach the Docker ingress, which handles its own
 middlewares and services, including the dashboard. Kop assigns every ingress
-router to `websecure` and enables TLS with an empty TLS configuration. Configure
-certificates on the receiving Traefik instance in k3s. Its TLS client
-must trust the Docker ingress certificate for the backend address.
+router to the entrypoints in `KOP_INGRESS_ENTRYPOINTS` (default `websecure`) and
+enables TLS with an empty TLS configuration. Configure certificates on the
+receiving Traefik.
+
+If several Docker routers share a rule, kop publishes one of them: a router with
+TLS first, then a router without a redirect middleware, then the first by name.
+This keeps the usual pair of an HTTPS router and an HTTP router that only
+redirects to HTTPS from competing on the same entrypoint.
+
+The receiving Traefik reaches the Docker ingress by IP, so the ingress
+certificate cannot match the backend address. Kop therefore publishes a
+`serversTransport` named `<hostname>_ingress` with `insecureSkipVerify` and uses
+it for the host backends. Set `KOP_INGRESS_VERIFY_BACKEND_CERTS=true` to verify
+the certificate instead; the receiving Traefik must then trust it for the IP.
+
+Traefik sends no SNI when it forwards to an IP. On the Docker ingress, avoid
+`sniStrict` in the default TLS options, and keep forwarded routers on the
+default TLS options: a router with other TLS options answers forwarded requests
+with `421 Misdirected Request`.
 
 Keep each instance's existing Redis identity (`KOP_HOSTNAME`) when enabling this
 mode so kop can remove its previously published keys. Instances using the mode
 must each have a unique hostname consisting of lowercase letters, digits, dots
 or hyphens. HTTP routing uses Docker's rules as published, so each dashboard
 still needs its own host rule.
+
+## Share routes between hosts (views)
+
+With several Docker hosts that each run Traefik, every Traefik can serve the
+routes of all hosts: requests for local routes go to the local containers,
+requests for the routes of another host go to that host's Traefik. A load
+balancer such as Caddy can then send any request to any healthy Traefik.
+
+Enable `KOP_VIEW` together with the ingress mode on every host:
+
+```yaml
+environment:
+  KOP_HOSTNAME: docker-01
+  BIND_IP: 10.8.0.25
+  KOP_DEFAULT_PORT: "443"
+  KOP_VIEW: "true"
+  REDIS_TTL: "120"
+  REDIS_SENTINEL_ADDRS: 10.8.0.25:26379,10.8.0.26:26379,10.8.0.27:26379
+  REDIS_SENTINEL_MASTER: kop
+```
+
+Each kop instance stores its published configuration at `kop/hosts/<hostname>`
+and announces changes on the Pub/Sub channel `kop:updates`. With `KOP_VIEW`, it
+combines the configurations of all *other* hosts below the root key
+`traefik-<hostname>`, e.g. `traefik-docker-01/http/routers/...`. Point the
+local Traefik at that root key. Its own routes come from its Docker provider.
+
+- **Local routes win.** A route whose rule also exists on the local host stays
+  out of the view, so a host never forwards what it serves itself. This also
+  prevents requests from bouncing between hosts that publish the same rule.
+- **Routes on several hosts are balanced.** HTTP routes with the same rule and
+  entrypoints on several other hosts become one router with a load balancer over
+  all of them. There are no health checks: a stopped host keeps receiving its
+  share until its configuration expires. TCP and UDP routes keep the first host
+  by name.
+- **Expiry.** Views resync every 10 seconds. Set `REDIS_TTL` so that a host that
+  goes away drops out of the views; without a TTL its routes stay until it
+  returns. kop renews its keys every third of the TTL. Leave room for a Sentinel
+  failover, during which kop cannot write: 120 seconds is a reasonable start.
+- **Shared root.** kop still publishes to the shared root key `traefik`, which
+  holds the routes of all hosts, e.g. for a Traefik in k3s. Set
+  `KOP_SHARED_ROOT=false` if nothing reads it. Never point a host's own Traefik
+  at the shared root: it would forward its own routes to itself.
+
+kop only writes to Redis when a configuration changes. It also checks its keys
+on every renewal and restores them if Redis lost them, e.g. after a Sentinel
+failover to a replica that missed recent writes.
+
+### Traefik and Valkey/Redis setup
+
+Configure the Redis provider of each host's Traefik with that host's root key,
+here through Sentinel:
+
+```yaml
+# traefik.yml on docker-01
+providers:
+  docker:
+    exposedByDefault: false
+  redis:
+    endpoints:
+      - 10.8.0.25:26379
+      - 10.8.0.26:26379
+      - 10.8.0.27:26379
+    rootKey: traefik-docker-01
+    sentinel:
+      masterName: kop
+```
+
+Traefik watches its root key through keyspace notifications. It enables them
+with `CONFIG SET` when it starts, but only on the node it connects to, and the
+setting does not survive a failover. Set it in the configuration of **every**
+Valkey/Redis node:
+
+```text
+notify-keyspace-events KEA
+```
+
+For the load balancer in front, check the health of each Traefik itself, e.g.
+with Traefik's `ping` endpoint. A host's routes still depend on that host's
+Traefik: if a host's Traefik is down, the other hosts cannot reach its apps
+either.
+
+### Import routes from another Traefik
+
+kop can import the HTTP routers of a Traefik it does not run next to, such as
+the one in k3s, so the Docker hosts forward those routes to it:
+
+```yaml
+environment:
+  KOP_IMPORT_TRAEFIK_API: http://10.8.0.10:9000
+  KOP_IMPORT_BACKEND: https://10.8.0.10:443
+  KOP_IMPORT_NAME: k3s
+```
+
+`KOP_IMPORT_TRAEFIK_API` is the base URL of that Traefik's API; credentials can
+be part of the URL (`http://user:pass@host:port`). kop reads
+`/api/http/routers` every `KOP_IMPORT_INTERVAL` seconds and publishes the
+routers as the pseudo host `k3s` (`kop/hosts/k3s`), forwarding to
+`KOP_IMPORT_BACKEND` like the ingress mode does, with the same entrypoints and
+`serversTransport` settings. It leaves out Traefik's internal routers, disabled
+routers and the routers that Traefik reads from Redis, so routes published by
+kop do not travel back to their hosts. Imported routes appear in the views only,
+never in the shared root key, which that Traefik may read itself.
+
+Enable the import on every kop instance that should keep it fresh; all of them
+publish the same pseudo host. If the API cannot be reached, the last import
+stays until it expires with `REDIS_TTL`.
 
 ## Namespaces
 
@@ -493,6 +629,8 @@ When Sentinel is configured, the `--redis-addr` flag is ignored.
 Both `--redis-sentinel-addrs` and `--redis-sentinel-master` must be provided
 together. The `--redis-user`, `--redis-pass`, and `--redis-db` flags still apply
 and are used for authenticating with the Redis master discovered by Sentinel.
+If the Sentinels themselves require authentication, set
+`--redis-sentinel-user` and `--redis-sentinel-pass`.
 
 ## Redis TLS
 
